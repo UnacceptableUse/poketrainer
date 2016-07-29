@@ -83,10 +83,6 @@ class PGoApi:
 
         self.pokemon_names = pokemon_names
 
-        self.start_time = time()
-        self.exp_start = None
-        self.exp_current = None
-
         self.MIN_ITEMS = {}
         for k, v in config.get("MIN_ITEMS", {}).items():
             self.MIN_ITEMS[getattr(Inventory, k)] = v
@@ -195,20 +191,6 @@ class PGoApi:
         else:
             raise AttributeError
 
-    def hourly_exp(self, exp):
-        if self.exp_start is None:
-            self.exp_start = exp
-        self.exp_current = exp
-
-        run_time = time() - self.start_time
-        run_time_hours = float(run_time/3600.00)
-        exp_earned = float(self.exp_current - self.exp_start)
-        exp_hour = float(exp_earned/run_time_hours)
-
-        self.log.info("=== Exp/Hour: %s ===", round(exp_hour,2))
-
-        return exp_hour
-
     def update_player_inventory(self):
         self.get_inventory()
         res = self.call()
@@ -244,7 +226,6 @@ class PGoApi:
                 if "player_stats" in inventory_item['inventory_item_data']:
                     self.player_stats = PlayerStats(inventory_item['inventory_item_data']['player_stats'])
                     self.log.info("Player Stats: %s", self.player_stats)
-                    self.hourly_exp(self.player_stats.experience)
             if self.LIST_INVENTORY_BEFORE_CLEANUP:
                 self.log.info("Player Items Before Cleanup: %s", self.inventory)
             self.log.debug(self.cleanup_inventory(self.inventory.inventory_items))
@@ -361,18 +342,22 @@ class PGoApi:
                                fort_longitude=fort['longitude'],
                                player_latitude=player_postion[0],
                                player_longitude=player_postion[1]).call()['responses']['FORT_SEARCH']
-        result = res.pop('result', -1)
-        if result == 1 and res:
+        result = res.get('result', -1)
+        if result == 1:
             items = defaultdict(int)
-            for item in res['items_awarded']:
-                items[item['item_id']] += item['item_count']
-            reward = 'XP +' + str(res['experience_awarded'])
-            for item_id, amount in items.iteritems():
-                reward += ', ' + str(amount) + 'x ' + get_item_name(item_id)
-            self.log.debug("Fort spinned: %s", res)
-            self.log.info("Fort Spinned, %s (http://maps.google.com/maps?q=%s,%s)",
-                          reward, fort['latitude'], fort['longitude'])
-            self.visited_forts[fort['id']] = fort
+            if 'items_awarded' in res:
+                for item in res['items_awarded']:
+                    items[item['item_id']] += item['item_count']
+                reward = 'XP +' + str(res['experience_awarded'])
+                for item_id, amount in items.iteritems():
+                    reward += ', ' + str(amount) + 'x ' + get_item_name(item_id)
+                self.log.debug("Fort spinned: %s", res)
+                self.log.info("Fort Spinned, %s (http://maps.google.com/maps?q=%s,%s)",
+                              reward, fort['latitude'], fort['longitude'])
+                self.visited_forts[fort['id']] = fort
+            else:
+                self.log.info("Couldn't spin this fort. No items?")
+                return False
         elif result == 4:
             self.log.debug("For spinned but Your inventory is full : %s", res)
             self.log.info("For spinned but Your inventory is full.")
@@ -384,7 +369,7 @@ class PGoApi:
         else:
             self.log.debug("Could not spin fort %s", res)
             self.log.info("Could not spin fort http://maps.google.com/maps?q=%s,%s, Error id: %s", fort['latitude'],
-                          fort['longitude'], result)
+                          fort['longitude'], res['result'])
             return False
         return True
 
@@ -572,7 +557,7 @@ class PGoApi:
             return False
         elif self.RELEASE_DUPLICATES and (
                     self.pokemon_lvl(best_pokemon) * self.RELEASE_DUPLICATES_SCALER > self.pokemon_lvl(
-                    pokemon) and self.pokemon_lvl(pokemon) < self.RELEASE_DUPLICATES_MAX_LV):
+                    pokemon) and pokemon.cp < self.RELEASE_DUPLICATES_MAX_LV):
             return True
         # release defined throwaway pokemons  but make sure we have kept at least 1 (dont throw away all of them)
         elif pokemon.pokemon_id in self.throw_pokemon_ids:
@@ -699,38 +684,34 @@ class PGoApi:
 
     def encounter_pokemon(self, pokemon_data, retry=False):  # take in a MapPokemon from MapCell.catchable_pokemons
         # Update Inventory to make sure we can catch this mon
-        try:
-            self.update_player_inventory()
-            if not self.inventory.can_attempt_catch():
-                self.log.info("No balls to catch %s, exiting encounter", self.inventory)
-                return False
-            encounter_id = pokemon_data['encounter_id']
-            spawn_point_id = pokemon_data['spawn_point_id']
-            # begin encounter_id
-            position = self.get_position()
-            self.log.info("Trying initiate catching Pokemon: %s", Pokemon(pokemon_data, self.pokemon_names))
-            encounter = self.encounter(encounter_id=encounter_id,
-                                       spawn_point_id=spawn_point_id,
-                                       player_latitude=position[0],
-                                       player_longitude=position[1]).call()['responses']['ENCOUNTER']
-            self.log.debug("Attempting to Start Encounter: %s", encounter)
-            pokemon = Pokemon(encounter.get('wild_pokemon', {}).get('pokemon_data', {}), self.pokemon_names)
-            result = encounter.get('status', -1)
-            capture_probability = create_capture_probability(encounter.get('capture_probability', {}))
-            self.log.debug("Attempt Encounter Capture Probability: %s", json.dumps(encounter, indent=4, sort_keys=True))
-            if result == 1:
-                return self.do_catch_pokemon(encounter_id, spawn_point_id, capture_probability, pokemon)
-            elif result == 7:
-                self.log.info("Couldn't catch %s Your pokemon bag was full, attempting to clear and re-try", pokemon)
-                self.cleanup_pokemon()
-                if not retry:
-                    return self.encounter_pokemon(pokemon, retry=True)
-            else:
-                self.log.info("Could not start encounter for pokemon: %s", pokemon)
+        self.update_player_inventory()
+        if not self.inventory.can_attempt_catch():
+            self.log.info("No balls to catch %s, exiting encounter", self.inventory)
             return False
-        except Exception as e:
-            self.log.error("Error in pokemon encounter %s", e)
-            return False
+        encounter_id = pokemon_data['encounter_id']
+        spawn_point_id = pokemon_data['spawn_point_id']
+        # begin encounter_id
+        position = self.get_position()
+        self.log.info("Trying initiate catching Pokemon: %s", Pokemon(pokemon_data, self.pokemon_names))
+        encounter = self.encounter(encounter_id=encounter_id,
+                                   spawn_point_id=spawn_point_id,
+                                   player_latitude=position[0],
+                                   player_longitude=position[1]).call()['responses']['ENCOUNTER']
+        self.log.debug("Attempting to Start Encounter: %s", encounter)
+        pokemon = Pokemon(encounter.get('wild_pokemon', {}).get('pokemon_data', {}), self.pokemon_names)
+        result = encounter.get('status', -1)
+        capture_probability = create_capture_probability(encounter.get('capture_probability', {}))
+        self.log.debug("Attempt Encounter Capture Probability: %s", json.dumps(encounter, indent=4, sort_keys=True))
+        if result == 1:
+            return self.do_catch_pokemon(encounter_id, spawn_point_id, capture_probability, pokemon)
+        elif result == 7:
+            self.log.info("Couldn't catch %s Your pokemon bag was full, attempting to clear and re-try", pokemon)
+            self.cleanup_pokemon()
+            if not retry:
+                return self.encounter_pokemon(pokemon, retry=True)
+        else:
+            self.log.info("Could not start encounter for pokemon: %s", pokemon)
+        return False
 
     def incubate_eggs(self):
         if not self.EGG_INCUBATION_ENABLED:
@@ -860,6 +841,7 @@ class PGoApi:
     def main_loop(self):
         catch_attempt = 0
         self.heartbeat()
+        # self.cleanup_inventory()
         while True:
             self.heartbeat()
             sleep(1)
